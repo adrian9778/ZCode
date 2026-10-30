@@ -1,16 +1,7 @@
+import type { HostRemoteConversationTelemetryResponse } from "@zcode/shared";
 import { ingestToolExecResource } from "./desktopResourceTelemetry.js";
 import { ingestMcpResourceSamples } from "./processResourceMcpTelemetrySource.js";
 /* eslint-disable max-lines -- host process 统一处理 main↔host 生命周期、日志、ZCode Agent，拆分前先保持跨进程消息收口。 */
-import { bindDatabaseStartupRelay } from "./databaseStartupRelay.js";
-import { randomUUID } from "node:crypto";
-import { join } from "node:path";
-import {
-  app,
-  BrowserWindow,
-  MessageChannelMain,
-  utilityProcess as electronUtilityProcess,
-} from "electron";
-import type { MessagePortMain, UtilityProcess as ElectronUtilityProcess } from "electron";
 import {
   type HostAgentProcessErrorResponse,
   type HostAgentProcessExceptionResponse,
@@ -20,40 +11,59 @@ import {
   type HostCuaOperationStateResponse,
   type HostMcpTelemetryResponse,
   type HostSessionCreateTelemetryResponse,
+  type HostPluginTelemetryResponse,
+  type ProviderProvisioningLaneStatus,
+  type RemoteTarget,
   type TaskRealtimeHostDeliveryKind,
+  type WorkspacePurpose,
   formatZCodeHostProcessName,
   HostMessageTypes,
-  HostResponseTypes,
   hostResponseMessageSchema,
+  HostResponseTypes,
   InternalChannels,
   LAUNCH_MARKS_QUERY_KEY,
   RUNTIME_ZCODE_DEBUG,
   serializeLaunchMarks,
-  type RemoteTarget,
-  type WorkspacePurpose,
   ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED_ENV,
 } from "@zcode/shared";
-import { getMainLaunchPartialMarks } from "./desktopLaunchMarks.js";
+import type {
+  PluginSandboxHandle,
+  PluginSandboxRegisterRequestPayload,
+  PluginSandboxRegisterResultPayload,
+} from "@zcode/shared/mcp-apps";
+import type { UtilityProcess as ElectronUtilityProcess, MessagePortMain } from "electron";
+import {
+  app,
+  BrowserWindow,
+  utilityProcess as electronUtilityProcess,
+  MessageChannelMain,
+} from "electron";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { BroadcastHub } from "./broadcastHub.js";
-import type { TaskRealtimeBus } from "./taskRealtimeBus.js";
+import { bindDatabaseStartupRelay } from "./databaseStartupRelay.js";
+import { getMainLaunchPartialMarks } from "./desktopLaunchMarks.js";
+import { ingestHostNetworkObservations } from "./desktopNetworkTelemetry.js";
+import {
+  buildHostProcessEnv,
+  hostModulePath,
+  resolveBundledGlmBinaryPath,
+} from "./desktopRuntimeEnv.js";
+import { ingestHostNetworkCapture } from "./resourceManagerNetwork.js";
+import { buildHostE2ECoverageEnv } from "./e2eCoverage.js";
+import { createFeedbackLogArchiveFromExportLogs } from "./exportLogs.js";
 import { createHostLogRelay } from "./hostLogRelay.js";
+import { ingestCliResourceSample } from "./processResourceCliSource.js";
+import { ingestHostSelfResourceSample } from "./processResourceSelfHeapSource.js";
+import { resolveHostResourceUsageResult } from "./resourceManagerHostSampling.js";
 import {
   registerHostAgentProcess,
   registerHostProcess,
   unregisterHostAgentProcess,
   unregisterHostProcess,
 } from "./resourceManagerWindow.js";
-import { resolveHostResourceUsageResult } from "./resourceManagerHostSampling.js";
-import {
-  buildHostProcessEnv,
-  hostModulePath,
-  resolveBundledGlmBinaryPath,
-} from "./desktopRuntimeEnv.js";
-import { ingestHostNetworkObservations } from "./desktopNetworkTelemetry.js";
-import { ingestCliResourceSample } from "./processResourceCliSource.js";
-import { ingestHostSelfResourceSample } from "./processResourceSelfHeapSource.js";
-import { createFeedbackLogArchiveFromExportLogs } from "./exportLogs.js";
-import { buildHostE2ECoverageEnv } from "./e2eCoverage.js";
+import type { RemoteAssetDirs } from "./desktopRuntimeEnv.js";
+import type { TaskRealtimeBus } from "./taskRealtimeBus.js";
 
 export interface WindowBootstrapOptions {
   restoreSession?: boolean;
@@ -66,6 +76,7 @@ export interface WindowBootstrapOptions {
 }
 
 export interface HostInitMessage {
+  browserBackendIdentity?: { id: string; generation: number };
   type: typeof HostMessageTypes.InitLocal;
   hostId?: string;
   databaseStartupId?: string;
@@ -79,13 +90,14 @@ export interface HostInitMessage {
     workspaceIdentity?: string;
   }>;
   agentSpawnFallbackCwd?: string;
+  remoteAssets?: RemoteAssetDirs;
   /** Main 解析后的 ZCode Built-in Provider Config 路径；Host/Services 不感知 Electron 安装布局。 */
   zcodeBuiltinProviderConfigFilePath: string;
   /** Main 提前异步采集并过滤的本机 runtime 环境；只允许传给 InitLocal。 */
   runtimeProcessEnvPatch?: Record<string, string>;
 }
 
-interface SpawnHostProcessOptions {
+export interface SpawnHostProcessOptions {
   internalChannel?: typeof InternalChannels.ServicePort | typeof InternalChannels.ScopedServicePort;
   internalPayload?: unknown;
   registerBroadcast?: boolean;
@@ -178,6 +190,8 @@ export function spawnHostProcess(
     onAgentProcessReady?: (event: HostAgentProcessReadyResponse) => void;
     onAgentProcessSpawned?: (event: HostAgentProcessSpawnedResponse) => void;
     onMcpTelemetry?: (event: HostMcpTelemetryResponse) => void;
+    onPluginTelemetry?: (event: HostPluginTelemetryResponse) => void;
+    onRemoteConversationTelemetry?: (event: HostRemoteConversationTelemetryResponse) => void;
     onSessionCreateTelemetry?: (event: HostSessionCreateTelemetryResponse) => void;
     onCuaOperationStateChanged?: (
       source: ElectronUtilityProcess,
@@ -197,6 +211,7 @@ export function spawnHostProcess(
     onOffPeakRunResult?: (result: {
       offPeakTaskId: string;
       ok: boolean;
+      lifecycleManaged?: true;
       conversationId?: string;
       sessionId?: string;
       error?: string;
@@ -212,6 +227,7 @@ export function spawnHostProcess(
       requestId: string;
       browserId?: string;
       browserGeneration?: number;
+      controlScopeId?: string;
       sessionId: string;
       turnId?: string;
       workspaceKey?: string;
@@ -224,6 +240,18 @@ export function spawnHostProcess(
     }) => Promise<{ ok: boolean; [k: string]: unknown }>;
     /** Host 已完成附件授权后，由 Main 将本地视频 realpath 加入精确协议授权集合。 */
     authorizeLocalMediaPreviewPath?: (path: string) => Promise<string>;
+    /** Host 校验完插件 UI HTML 后交给 Main 沙箱注册表登记，返回句柄。 */
+    registerPluginSandbox?: (
+      input: PluginSandboxRegisterRequestPayload,
+    ) => PluginSandboxHandle | Promise<PluginSandboxHandle>;
+    /** 数据同步页经本机 Host 读取 / 重试 Main 协调器的 Provisioning lane（按 sourceServerId）。 */
+    providerProvisioningLanes?: {
+      getStatus(
+        sourceServerId: string,
+        options: { waitForIdle: boolean },
+      ): Promise<ProviderProvisioningLaneStatus>;
+      retry(sourceServerId: string): Promise<ProviderProvisioningLaneStatus>;
+    };
   },
   options?: SpawnHostProcessOptions,
 ): ElectronUtilityProcess {
@@ -301,7 +329,10 @@ export function spawnHostProcess(
       ingestHostNetworkObservations(result.data.observations);
       return;
     }
-
+    if (result.data.type === HostResponseTypes.NetworkCaptureBatch) {
+      ingestHostNetworkCapture(result.data.batch, child.pid ?? 0);
+      return;
+    }
     // CLI 自采的 60 秒样本：按 services 打的 lane 归入 cli_chat / cli_aux 角色。
     if (result.data.type === HostResponseTypes.AgentResourceSample) {
       ingestCliResourceSample(
@@ -342,6 +373,15 @@ export function spawnHostProcess(
       return;
     }
 
+    if (result.data.type === HostResponseTypes.PluginTelemetry) {
+      dependencies.onPluginTelemetry?.(result.data);
+      return;
+    }
+
+    if (result.data.type === HostResponseTypes.RemoteConversationTelemetry) {
+      dependencies.onRemoteConversationTelemetry?.(result.data);
+      return;
+    }
     if (result.data.type === HostResponseTypes.SessionCreateTelemetry) {
       dependencies.onSessionCreateTelemetry?.(result.data);
       return;
@@ -379,9 +419,64 @@ export function spawnHostProcess(
       return;
     }
 
+    if (result.data.type === HostResponseTypes.PluginSandboxRegisterRequest) {
+      const request = result.data;
+      const register = dependencies.registerPluginSandbox;
+      const reply = (payload: PluginSandboxRegisterResultPayload) =>
+        child.postMessage({ type: HostMessageTypes.PluginSandboxRegisterResult, ...payload });
+      if (!register || win.isDestroyed() || request.ownerWebContentsId !== win.webContents.id) {
+        reply({
+          requestId: request.requestId,
+          ok: false,
+          error: "Plugin UI sandbox is unavailable.",
+        });
+        return;
+      }
+      void Promise.resolve()
+        .then(() => register(request))
+        .then((handle) => reply({ requestId: request.requestId, ok: true, ...handle }))
+        .catch((error: unknown) =>
+          reply({
+            requestId: request.requestId,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      return;
+    }
+
     if (result.data.type === HostResponseTypes.CuaOperationState) {
       // Main 只投影 Host 已经判定的 turn 状态，不在这里重复解析 session/tool 业务事件。
       dependencies.onCuaOperationStateChanged?.(child, result.data);
+      return;
+    }
+
+    if (result.data.type === HostResponseTypes.ProviderProvisioningLaneRequest) {
+      const request = result.data;
+      const lanes = dependencies.providerProvisioningLanes;
+      const reply = (status: ProviderProvisioningLaneStatus) =>
+        child.postMessage({
+          type: HostMessageTypes.ProviderProvisioningLaneResult,
+          requestId: request.requestId,
+          status,
+        });
+      // 没有协调器（例如未接线的测试宿主）时回「无 lane」：Host 请求总有应答，不靠超时收尾。
+      if (!lanes) {
+        reply({ lane: "none" });
+        return;
+      }
+      void (
+        request.action === "retry"
+          ? lanes.retry(request.sourceServerId)
+          : lanes.getStatus(request.sourceServerId, { waitForIdle: request.action === "wait" })
+      ).then(reply, (error: unknown) => {
+        // 协调器的查询与重试不会抛出；万一抛出也要应答，避免 Renderer 一直停在「同步中」。
+        dependencies.logger.warn("[provider-provisioning] lane request failed", {
+          action: request.action,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        reply({ lane: "none" });
+      });
       return;
     }
 
@@ -426,6 +521,7 @@ export function spawnHostProcess(
           ? handler({
               win,
               requestId,
+              controlScopeId: result.data.controlScopeId,
               browserId: result.data.browserId,
               browserGeneration: result.data.browserGeneration,
               sessionId: result.data.sessionId,
@@ -506,6 +602,7 @@ export function spawnHostProcess(
       dependencies.onOffPeakRunResult?.({
         offPeakTaskId: result.data.offPeakTaskId,
         ok: result.data.ok,
+        lifecycleManaged: result.data.lifecycleManaged,
         conversationId: result.data.conversationId,
         sessionId: result.data.sessionId,
         error: result.data.error,

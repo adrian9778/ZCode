@@ -3,7 +3,9 @@ import { runWithModelInvocationContext, traceContextToLogContext } from "../deps
 import type { ModelReasoningContentBlock, ModelToolCall, ModelUsage, ToolCallId } from "../deps.js";
 import {
   buildSuspiciousEmptyDiagnostics,
+  createContentFilteredModelResultError,
   finalizeSuspiciousEmptyModelResult,
+  isContentFilteredEmptyModelResult,
   isContextExceededFinishReason,
   isSuspiciousEmptyModelResult,
   logModelRequestMediaSummary,
@@ -22,8 +24,15 @@ import { modelRequestTokenLimitLogContext } from "./model-token-limits.js";
 import { createModelStreamingEventQueue } from "./model-streaming-event-queue.js";
 import { getOrCreateReasoningBlock } from "./reasoning-stream.js";
 import { createRefreshRuntimeHeadersBeforeModelAttempt } from "./model-runtime-headers.js";
-import { resolveModelRequestSessionTypeFromTaskType } from "./model-request-session-type.js";
 import { isOutputTokenLimitFinishReason } from "./turn-output-token-continuation.js";
+import {
+  finishProviderToolCard,
+  persistProviderToolRoundContent,
+  providerToolOutputText,
+  settleUnfinishedProviderToolCards,
+  startProviderToolCard,
+  type ProviderToolRound,
+} from "../provider-tool-rounds/contract.js";
 
 const TOOL_INPUT_STREAM_DELTA_FALLBACK_FLUSH_CHARS = 4096;
 
@@ -79,8 +88,8 @@ export async function runModelTextRequest(
   // 任务预算；adapter 只做 provider 兼容映射，不再施加独立 global cap。
   const modelInvocationContext = {
     metadata: traceContextToLogContext(projectedOptions.traceContext),
-    modelRequestSessionType: resolveModelRequestSessionTypeFromTaskType(this.config.taskType),
-    // 重试预算与准入端口不在这里设：它们是 runtime 层字段，由 createRuntimeModel 绑在句柄上，turn step 与工具内部的模型调用同一来源。
+    // 会话类型、重试预算与准入端口由 createRuntimeModel 绑在句柄上
+    // turn step 与工具内部的模型调用同一来源。
     modelCall: {
       // 普通 Agent Step 以前只靠 metadata.querySource 在 Adapter 中反推
       // operation/actor；元数据一旦改名或缺失，就会误记为 tool_internal_model_call。
@@ -119,6 +128,7 @@ export async function runModelTextRequest(
   const modelRequest = {
     messages: projectedOptions.messages,
     tools: projectedOptions.tools,
+    toolSearchEnabled: projectedOptions.toolSearchEnabled,
     abortSignal: projectedOptions.abortSignal,
     ...(projectedOptions.maxOutputTokens !== undefined
       ? { options: { maxOutputTokens: projectedOptions.maxOutputTokens } }
@@ -155,16 +165,30 @@ export async function runModelTextRequest(
     };
   }
 
+  // text/reasoning 只属于当前轮；每遇到服务端内置工具就收进 providerToolRounds 并重新开始。
   let text = "";
   let finishReason = "unknown";
   let usage: ModelUsage = {};
   let providerMetadata: Record<string, unknown> | undefined;
-  const reasoning: ModelReasoningContentBlock[] = [];
+  let reasoning: ModelReasoningContentBlock[] = [];
   const reasoningById = new Map<string, ModelReasoningContentBlock>();
   const toolCalls: ModelToolCall[] = [];
   const toolCallIds = new Set<string>();
   const toolInputDeltaBuffers = new Map<ToolCallId, string>();
-  const publishStreamSnapshot = () => options.onStreamSnapshot?.({ reasoning, text });
+  const providerToolRounds: ProviderToolRound[] = [];
+  const providerToolStartedAt = new Map<string, number>();
+  let roundStartedAt = Date.now();
+  const providerToolCardContext = {
+    assistantMessageId: options.assistantMessageId,
+    events: options.events,
+    traceContext: options.traceContext,
+  };
+  const publishStreamSnapshot = () =>
+    options.onStreamSnapshot?.({
+      reasoning,
+      text,
+      ...(providerToolRounds.length > 0 ? { providerToolRounds } : {}),
+    });
   const streamingEventQueue = createModelStreamingEventQueue({
     events: options.events,
     runtime: this,
@@ -329,6 +353,8 @@ export async function runModelTextRequest(
           break;
         }
 
+        // 原始参数流保留包装结构；目标身份由公共准入产生，再通过工具事件交给展示投影。
+        // 不从参数 delta 推测执行目标，也不为展示身份调整模型流或工具调度时序。
         case "tool_input_start": {
           const toolCallId = event.id as ToolCallId;
           toolInputDeltaBuffers.delete(toolCallId);
@@ -417,6 +443,48 @@ export async function runModelTextRequest(
             toolName: toolCall.name,
           });
           options.onStreamToolCall?.(toolCall);
+          if (toolCall.providerExecuted) {
+            // 服务端已执行：收起当前轮并按流顺序落盘，卡片先显示为运行中，等结果事件补齐。
+            // messageId 是这一轮 part 落盘的消息，也是 compact 分组键（与冷恢复的 message.info.id 相同）。
+            const round: ProviderToolRound = {
+              messageId: options.assistantMessageId,
+              reasoning,
+              text,
+              toolCall,
+            };
+            providerToolRounds.push(round);
+            await persistProviderToolRoundContent(
+              this,
+              providerToolCardContext,
+              round,
+              roundStartedAt,
+            );
+            text = "";
+            reasoning = [];
+            reasoningById.clear();
+            roundStartedAt = Date.now();
+            providerToolStartedAt.set(toolCall.id, roundStartedAt);
+            await startProviderToolCard(this, providerToolCardContext, toolCall, roundStartedAt);
+            publishStreamSnapshot();
+          }
+          break;
+        }
+
+        case "provider_tool_result": {
+          const round = providerToolRounds.find(
+            (candidate) => candidate.toolCall.id === event.toolCallId && !candidate.result,
+          );
+          if (!round) break;
+          const result = { output: providerToolOutputText(event.output), isError: event.isError };
+          round.result = result;
+          await streamingEventQueue.drain();
+          await finishProviderToolCard(
+            this,
+            providerToolCardContext,
+            { ...round, result },
+            providerToolStartedAt.get(round.toolCall.id) ?? roundStartedAt,
+          );
+          publishStreamSnapshot();
           break;
         }
 
@@ -450,14 +518,43 @@ export async function runModelTextRequest(
     }
   } catch (error) {
     await streamingEventQueue.drain();
+    // 失败或取消发生在服务端调用与结果之间时，卡片也要有终态；收口失败不能盖住原始错误。
+    await settleUnfinishedProviderToolCards(
+      this,
+      providerToolCardContext,
+      providerToolRounds,
+      providerToolStartedAt,
+    ).then(
+      (settled) => settled && publishStreamSnapshot(),
+      (settleError) =>
+        this.logger?.warn("Failed to settle provider tool cards after stream failure", {
+          ...traceContextToLogContext(options.traceContext),
+          event: "model.runtime.stream.provider_tool_settle_failed",
+          module: "core.runtime",
+          error: settleError instanceof Error ? settleError.message : String(settleError),
+        }),
+    );
     throw error;
   }
   await streamingEventQueue.drain();
+  if (
+    await settleUnfinishedProviderToolCards(
+      this,
+      providerToolCardContext,
+      providerToolRounds,
+      providerToolStartedAt,
+    )
+  ) {
+    publishStreamSnapshot();
+  }
 
   const rawFinishReason = readRawFinishReason(providerMetadata);
   const outputTokenLimit = isOutputTokenLimitFinishReason(finishReason, rawFinishReason);
+  // 与 turn 层同一口径：已切成前序轮次的服务端内置工具不算本 step 的调用，超窗仍要交给 Reactive Compact。
   const contextExceeded =
-    toolCalls.length === 0 &&
+    toolCalls.every((toolCall) =>
+      providerToolRounds.some((round) => round.toolCall.id === toolCall.id),
+    ) &&
     !outputTokenLimit &&
     isContextExceededFinishReason(finishReason, rawFinishReason);
   if (contextExceeded) {
@@ -473,6 +570,25 @@ export async function runModelTextRequest(
       rawFinishReason,
       textLength: text.length,
       toolCallCount: toolCalls.length,
+    });
+  }
+
+  if (
+    isContentFilteredEmptyModelResult(finishReason, rawFinishReason, text.length, toolCalls.length)
+  ) {
+    this.logger?.warn("Model stream was blocked by provider content filter", {
+      ...traceContextToLogContext(options.traceContext),
+      event: "model.runtime.stream.content_filtered",
+      finishReason,
+      module: "core.runtime",
+      modelProviderId: executionModelSelection.providerId,
+      modelId: executionModelSelection.modelId,
+      rawFinishReason,
+    });
+    throw createContentFilteredModelResultError({
+      finishReason,
+      model: executionModelSelection,
+      rawFinishReason,
     });
   }
 
@@ -513,6 +629,7 @@ export async function runModelTextRequest(
     reasoning: reasoning.length > 0 ? reasoning : undefined,
     text,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    ...(providerToolRounds.length > 0 ? { providerToolRounds } : {}),
     usage,
   };
 }

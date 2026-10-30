@@ -1,5 +1,6 @@
+/* eslint-disable max-lines -- Desktop renderer bridge 聚合平台、远端 attachment 与启动编排契约。 */
 import { DatabaseStartupAdmission } from "./databaseStartupAdmission.js";
-import { initializeDesktopLocalTtft } from "./localTtftBootstrap.js";
+import { initializeDesktopLocalTtft } from "./local-ttft/contract.js";
 import { createRoot } from "react-dom/client";
 import { useEffect } from "react";
 import {
@@ -11,6 +12,7 @@ import {
   registerBaseWorkspaceServices,
   registerRemoteWorkspaceSession,
   createRemoteWorkspaceDisconnectedError,
+  installDocumentHiddenMotionPause,
   playTaskNotificationSound,
   setStreamClientId,
   setReactErrorArmsReporter,
@@ -21,7 +23,6 @@ import {
   InternalChannels,
   databaseStartupStateSchema,
   type DatabaseStartupControl,
-  collectTelemetryRendererContext,
   parseLaunchMarks,
   LAUNCH_MARKS_QUERY_KEY,
   type LaunchMarks,
@@ -29,11 +30,11 @@ import {
 } from "@zcode/shared";
 import type { Locale } from "@zcode/shared";
 import type { IServiceAccessor } from "@zcode/services";
-import { syncAppTelemetryContext } from "../appTelemetryBridge.js";
 import { createDesktopPlatform } from "./desktopPlatform.js";
 import { startPerformanceTimelineCleanup } from "./performanceTimelineCleanup.js";
 import { initializeDesktopUserActionTrace } from "./userActionTraceBootstrap.js";
-import { buildRemoteWorkspaceSessionServices } from "./remoteWorkspaceSessionServices.js";
+import { buildRemoteWorkspaceSessionServicesForRegistration } from "./remoteWorkspaceSessionServices.js";
+import { handleSourceSettingsServicePortMessage } from "./sourceSettingsServicePortBridge.js";
 import {
   notifyRemoteWorkspaceServicePortReady,
   parseRemoteWorkspaceServicePortMessage,
@@ -112,8 +113,11 @@ document.documentElement.classList.toggle("platform-windows-desktop", isWindowsD
 // 会把标题栏点击区一起拦截。给桌面 Linux 根节点打平台标记，让 UI overlay 能只在 Linux 避开标题栏。
 document.documentElement.classList.toggle("platform-linux-desktop", isLinuxDesktop);
 const isLocalDevelopmentRuntime =
-  (globalThis as typeof globalThis & { __ZCODE_LOCAL_DEVELOPMENT_RUNTIME__?: boolean })
-    .__ZCODE_LOCAL_DEVELOPMENT_RUNTIME__ === true;
+  (
+    globalThis as typeof globalThis & {
+      __ZCODE_LOCAL_DEVELOPMENT_RUNTIME__?: boolean;
+    }
+  ).__ZCODE_LOCAL_DEVELOPMENT_RUNTIME__ === true;
 
 function readBooleanFlag(name: string, defaultValue: boolean): boolean {
   const value = new URLSearchParams(window.location.search).get(name);
@@ -156,6 +160,8 @@ initializeDesktopUserActionTrace({
  */
 // 之前用匿名函数注册 addEventListener("message")，reload/HMR 时会重复注册，
 // 导致多次 createRoot 在同一 DOM 节点上挂载。用 flag 防止重复初始化。
+// 窗口 hidden 时禁用 CSS 动画，避免 DocumentTimeline 持有已卸载的 DOM 子树。
+installDocumentHiddenMotionPause();
 let appInitialized = false;
 const databaseStartupAdmission = new DatabaseStartupAdmission();
 const appRoot =
@@ -218,12 +224,18 @@ function registerRemoteWorkspaceServicePort(params: RemoteWorkspaceServicePortRe
 
   const remoteConnection = createMessagePortServiceConnection(params.port);
   const remoteServices = remoteConnection.services;
-  const services = buildRemoteWorkspaceSessionServices(
-    baseServicesForRemoteSessions,
+  const services = buildRemoteWorkspaceSessionServicesForRegistration({
+    baseServices: baseServicesForRemoteSessions,
     remoteServices,
-  );
+    targetKind: params.target.kind,
+    sourceServerId: params.sourceServerId,
+  });
   registerRemoteWorkspaceSession({
     sessionId: params.sessionId,
+    ...(params.sourceServerId ? { sourceServerId: params.sourceServerId } : {}),
+    ...(params.workspacePath ? { workspacePath: params.workspacePath } : {}),
+    ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+    ...(params.workspacePurpose ? { workspacePurpose: params.workspacePurpose } : {}),
     target: params.target,
     services,
     dispose: (reason) =>
@@ -275,6 +287,8 @@ function handleServicePortMessage(event: MessageEvent): void {
     return;
   }
 
+  if (handleSourceSettingsServicePortMessage(event)) return;
+
   const remoteWorkspacePort = parseRemoteWorkspaceServicePortMessage(event);
   if (remoteWorkspacePort) {
     if (!baseServicesForRemoteSessions) {
@@ -302,18 +316,14 @@ function handleServicePortMessage(event: MessageEvent): void {
 
 function initializeBusinessRoot(port: MessagePort): void {
   appInitialized = true;
-  const services = connectViaMessagePort(port);
+  const services = connectViaMessagePort(port, {
+    sourceServerManagementService: true,
+    deviceSyncStateService: true,
+  });
   baseServicesForRemoteSessions = services;
   registerBaseWorkspaceServices(services);
   flushPendingRemoteWorkspaceServicePorts();
   const settingService = supportsSettings ? services.settingService : undefined;
-
-  syncAppTelemetryContext({
-    bridge: {
-      syncTelemetryContext: (context) => window.zcode.syncTelemetryContext(context),
-    },
-    createRendererContext: collectTelemetryRendererContext,
-  });
 
   // 初始化稳定的设备 ID，确保所有 hook 在首次渲染前就使用正确的值
   setStreamClientId(desktopPlatform.getDeviceId());

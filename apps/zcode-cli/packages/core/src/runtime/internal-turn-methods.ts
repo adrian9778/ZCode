@@ -1,5 +1,5 @@
 import type { BackgroundBashOutputResult } from "@zcode/shared";
-import type { RuntimeInputPresentation } from "@zcode/contracts";
+import type { ModelToolContract, RuntimeInputPresentation } from "@zcode/contracts";
 import type {
   CompactPhase,
   CompactReason,
@@ -214,7 +214,9 @@ export interface AgentRuntimeTurnMethods {
       sourceCommandId?: string;
       trigger?: CompactTrigger;
       model?: Model;
+      agentListingTools?: readonly { name: string }[];
       activeEntries?: readonly RuntimeMessageEntry[];
+      getContinuationTools?: () => readonly ModelToolContract[];
     },
   ): Promise<{
     displayText: string;
@@ -300,6 +302,7 @@ export interface AgentRuntimeTurnMethods {
     traceContext: TraceContext,
     events: SessionEvent[],
     options?: {
+      persist?: boolean;
       onStatus?: (event: ModelNetworkStatusEvent) => void;
       streamRecovery?: ModelStreamRecoveryStatus;
     },
@@ -362,6 +365,7 @@ export interface AgentRuntimeTurnMethods {
     options?: {
       model?: Model;
       operationId?: string;
+      leadingReminderEntries?: readonly RuntimeMessageEntry[];
       postCompactReminderEntries?: readonly RuntimeMessageEntry[];
     },
   ): Promise<void>;
@@ -397,7 +401,7 @@ export interface AgentRuntimeTurnMethods {
     messageID: MessageId;
     sessionId: SessionId;
     source: SyntheticUserMessageSource;
-    text: string;
+    text: string | readonly string[];
     traceContext: TraceContext;
     metadata?: Record<string, unknown>;
     visibility?: MessageVisibility;
